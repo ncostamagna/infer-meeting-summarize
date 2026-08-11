@@ -1,0 +1,11 @@
+FROM vllm/vllm-openai:latest
+
+# La imagen oficial no trae las dependencias de audio, por lo que
+# /v1/audio/transcriptions falla con "Please install vllm[audio]".
+# libsndfile1 es la lib de sistema que necesita soundfile.
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libsndfile1 ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir librosa soundfile

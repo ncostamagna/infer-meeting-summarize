@@ -1,0 +1,85 @@
+services:
+  vllm-asr:
+    build:
+      context: .
+      dockerfile: Dockerfile.asr
+    image: inference-hub/vllm-asr:latest
+    container_name: vllm-asr
+    profiles: ["transcribe"]
+    ipc: host
+    environment:
+      - HF_HOME=/root/.cache/huggingface
+      - HF_TOKEN=${HF_TOKEN}
+      # Usa solo el cache local, sin salir a internet. Para agregar un modelo
+      # nuevo hay que sacarla, levantarlo una vez, y volver a ponerla.
+      - HF_HUB_OFFLINE=1
+      - VLLM_ATTENTION_BACKEND=TRITON_ATTN
+    volumes:
+      - ${HF_CACHE_DIR:-./hf-cache}:/root/.cache/huggingface
+    ports:
+      - "8001:8000"
+    command:
+      - --model=openai/whisper-large-v3
+      # Memoria unificada: este porcentaje sale de los 128 GB del sistema,
+      # no de una VRAM aparte. Whisper-large-v3 son ~3 GB de pesos.
+      - --gpu-memory-utilization=0.15
+      - --enforce-eager
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  pipeline:
+    build:
+      context: ./pipeline
+    image: inference-hub/meeting-pipeline:latest
+    container_name: meeting-pipeline
+    profiles: ["transcribe"]
+    environment:
+      - HF_HOME=/root/.cache/huggingface
+      - HF_TOKEN=${HF_TOKEN}
+      - HF_HUB_OFFLINE=1
+      - ASR_URL=http://vllm-asr:8000/v1/audio/transcriptions
+    volumes:
+      - ${HF_CACHE_DIR:-./hf-cache}:/root/.cache/huggingface
+    ports:
+      - "8002:8000"
+    depends_on:
+      - vllm-asr
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  vllm-summarize:
+    image: vllm/vllm-openai:latest
+    container_name: vllm-summarize
+    profiles: ["summarize"]
+    ipc: host
+    environment:
+      - HF_HOME=/root/.cache/huggingface
+      - HF_TOKEN=${HF_TOKEN}
+    volumes:
+      - ${HF_CACHE_DIR:-./hf-cache}:/root/.cache/huggingface
+    ports:
+      - "8003:8000"
+    command:
+      - --model=Qwen/Qwen2.5-72B-Instruct-AWQ
+      - --quantization=awq
+      # ~42 GB de pesos + activaciones; el resto del presupuesto va a KV cache.
+      # Deja lugar para vllm-asr (0.15) y el sistema en la memoria unificada.
+      - --gpu-memory-utilization=0.50
+      - --max-model-len=16384
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

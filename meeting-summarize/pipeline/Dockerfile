@@ -1,6 +1,6 @@
-# Parte de la imagen de vLLM a propósito: ya trae un PyTorch que funciona en
-# este hardware (Blackwell / sm_121, ARM64). Instalar torch desde cero acá es
-# la principal fuente de dolor en esta máquina.
+# Based on the vLLM image on purpose: it already ships a PyTorch that works on
+# this hardware (Blackwell / sm_121, ARM64). Installing torch from scratch here
+# is the main source of pain on this machine.
 FROM vllm/vllm-openai:latest
 
 USER root
@@ -8,9 +8,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Congela el torch/torchaudio que ya trae la imagen. Sin esto, pip es libre de
-# reemplazarlos por wheels genéricos sin soporte para sm_121 y el contenedor
-# arranca pero no ve la GPU.
+# Freeze the torch/torchaudio already present in the image. Without this, pip is
+# free to replace them with generic wheels lacking sm_121 support, and the
+# container then starts but cannot see the GPU.
 RUN python3 -c "\
 import torch, torchaudio; \
 open('/tmp/constraints.txt','w').write(\
@@ -18,8 +18,8 @@ open('/tmp/constraints.txt','w').write(\
 torch.__version__.split('+')[0], torchaudio.__version__.split('+')[0]))" \
     && cat /tmp/constraints.txt
 
-# Sin pin de versión: pyannote 3.3.x usa torchaudio.AudioMetaData, que las
-# versiones nuevas de torchaudio ya no exponen.
+# No version pin: pyannote 3.3.x uses torchaudio.AudioMetaData, which newer
+# torchaudio releases no longer expose.
 RUN python3 -m pip install --no-cache-dir -c /tmp/constraints.txt \
     pyannote.audio \
     fastapi \

@@ -10,10 +10,14 @@ services:
     environment:
       - HF_HOME=/root/.cache/huggingface
       - HF_TOKEN=${HF_TOKEN}
-      # Usa solo el cache local, sin salir a internet. Para agregar un modelo
-      # nuevo hay que sacarla, levantarlo una vez, y volver a ponerla.
+      # Use only the local cache, no outbound traffic. To add a new model,
+      # remove this, start it once to download, then put it back.
       - HF_HUB_OFFLINE=1
       - VLLM_ATTENTION_BACKEND=TRITON_ATTN
+      # Defaults are 25 MB / 600 s, meant for short clips. A meeting arrives as
+      # a single 16 kHz mono WAV (~115 MB/h), so both have to go up together.
+      - VLLM_MAX_AUDIO_CLIP_FILESIZE_MB=1024
+      - VLLM_MAX_AUDIO_DECODE_DURATION_S=21600
     volumes:
       - ${HF_CACHE_DIR:-./hf-cache}:/root/.cache/huggingface
     ports:
@@ -65,6 +69,7 @@ services:
     environment:
       - HF_HOME=/root/.cache/huggingface
       - HF_TOKEN=${HF_TOKEN}
+      - HF_HUB_OFFLINE=1
     volumes:
       - ${HF_CACHE_DIR:-./hf-cache}:/root/.cache/huggingface
     ports:
@@ -72,8 +77,8 @@ services:
     command:
       - --model=Qwen/Qwen2.5-72B-Instruct-AWQ
       - --quantization=awq
-      # ~42 GB de pesos + activaciones; el resto del presupuesto va a KV cache.
-      # Deja lugar para vllm-asr (0.15) y el sistema en la memoria unificada.
+      # ~42 GB of weights + activations; the rest of the budget goes to KV cache.
+      # Leaves room for vllm-asr (0.15) and the system in unified memory.
       - --gpu-memory-utilization=0.50
       - --max-model-len=16384
     deploy:

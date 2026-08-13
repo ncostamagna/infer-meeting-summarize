@@ -8,8 +8,11 @@ The two are merged by temporal overlap: each Whisper segment is assigned the
 speaker who occupies the most time within that range.
 """
 
+import asyncio
+import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 from contextlib import asynccontextmanager
@@ -27,17 +30,80 @@ HF_TOKEN = os.environ.get("HF_TOKEN")
 
 SUMMARIZER_URL = os.environ.get("SUMMARIZER_URL", "http://vllm-summarize:8000/v1/chat/completions")
 SUMMARIZER_MODEL = os.environ.get("SUMMARIZER_MODEL", "Qwen/Qwen2.5-72B-Instruct-AWQ")
+# vLLM exposes the tokenizer next to the OpenAI routes, outside /v1.
+TOKENIZE_URL = SUMMARIZER_URL.replace("/v1/chat/completions", "/tokenize")
 
 # A long meeting can take several minutes: the ASR request is not streamed.
 ASR_TIMEOUT = float(os.environ.get("ASR_TIMEOUT", "3600"))
 SUMMARIZER_TIMEOUT = float(os.environ.get("SUMMARIZER_TIMEOUT", "1800"))
 
-SYSTEM_PROMPT = """You summarize meeting transcripts.
+# Must match --max-model-len on the vllm-summarize service.
+SUMMARIZER_CONTEXT = int(os.environ.get("SUMMARIZER_CONTEXT", "32768"))
+# Output budgets. Without an explicit max_tokens vLLM gives the reply whatever is
+# left of the context, which silently shrinks to nothing on a long transcript.
+SUMMARY_MAX_TOKENS = int(os.environ.get("SUMMARY_MAX_TOKENS", "4096"))
+NOTES_MAX_TOKENS = int(os.environ.get("NOTES_MAX_TOKENS", "1536"))
+# Leaf sections stay well under the context so the model attends over all of it.
+SECTION_BUDGET_TOKENS = int(os.environ.get("SECTION_BUDGET_TOKENS", "6000"))
+# The segmentation pass only emits boundaries, so its window can be much larger.
+SEGMENTATION_WINDOW_TOKENS = int(os.environ.get("SEGMENTATION_WINDOW_TOKENS", "12000"))
+# vLLM batches concurrent requests, and batching is what makes a memory-bound 72B
+# worth running: the weights are read once for the whole batch.
+MAP_CONCURRENCY = int(os.environ.get("MAP_CONCURRENCY", "4"))
 
-The transcript is labeled by speaker (SPEAKER_00, SPEAKER_01, ...) with timestamps.
-Speaker labels are anonymous: use them as-is unless the transcript reveals a name.
+# Empty means "follow the transcript". Set it to force the output language.
+SUMMARY_LANGUAGE = os.environ.get("SUMMARY_LANGUAGE", "").strip()
+_LANGUAGE_RULE = (
+    f"Write your reply in {SUMMARY_LANGUAGE}."
+    if SUMMARY_LANGUAGE
+    else "Write your reply in the same language the transcript is in."
+)
 
-Produce a summary in Markdown format, Dont omit any important information and do not invent details.
+SYSTEM_PROMPT = f"""You summarize meeting transcripts.
+
+You receive either the transcript itself or structured notes taken over it section
+by section, in order. Speaker labels (SPEAKER_00, SPEAKER_01, ...) are anonymous:
+use them as-is unless a real name is revealed.
+
+{_LANGUAGE_RULE} Produce Markdown. Cover every topic your input mentions and do not
+invent details that are not in it.
+
+Structure it as:
+- **Executive summary** - a short paragraph.
+- **Topics discussed** - one subsection per topic, with what was said and by whom.
+- **Decisions** - what was actually decided, not what was merely discussed.
+- **Action items** - owner, task and deadline where stated; say so when one is missing.
+- **Open questions** - anything left unresolved.
+
+Drop a section only if the notes genuinely have nothing for it.
+"""
+
+SEGMENTER_PROMPT = f"""You split meeting transcripts into topical sections.
+
+You receive numbered blocks of a transcript: `[N] [timestamp] SPEAKER: text`.
+Identify where the conversation moves on to a new topic.
+
+Reply with ONLY a JSON array, no prose and no code fence:
+[{{"block": 12, "title": "short topic title"}}, ...]
+
+Rules:
+- `block` is the number of the block where the new topic STARTS.
+- Return the boundaries in ascending order.
+- Only real topic shifts. An excerpt this size usually has a handful, not dozens.
+- {_LANGUAGE_RULE}
+- If the whole excerpt is a single topic, reply with [].
+"""
+
+EXTRACTOR_PROMPT = f"""You take structured notes on one section of a meeting transcript.
+
+Do NOT write a summary or a narrative: extract the facts, so that someone can write
+the summary later from your notes alone. Keep the detail - this is the step where
+information gets lost if you compress it.
+
+{_LANGUAGE_RULE} Reply in Markdown bullets, covering whatever is present: points made
+(and by which speaker), decisions taken, action items with their owner, figures, dates,
+names, tools, and open questions. Keep the `[hh:mm:ss]` timestamp on anything
+important. Do not invent anything.
 """
 
 logging.basicConfig(level=logging.INFO)
@@ -214,19 +280,16 @@ def format_transcript(segments: list[dict]) -> str:
     )
 
 
-async def summarize_text(transcript: str, instructions: str | None) -> str:
-    """Send the transcript to the summarization model."""
-    user_content = transcript
-    if instructions:
-        user_content = f"{instructions}\n\n---\n\n{transcript}"
-
+async def chat(system: str, user: str, max_tokens: int) -> str:
+    """One call to the summarization model."""
     payload = {
         "model": SUMMARIZER_MODEL,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
         ],
         "temperature": 0.2,
+        "max_tokens": max_tokens,
     }
 
     async with httpx.AsyncClient(timeout=SUMMARIZER_TIMEOUT) as client:
@@ -243,6 +306,180 @@ async def summarize_text(transcript: str, instructions: str | None) -> str:
         raise HTTPException(status_code=502, detail=f"Summarizer returned {resp.status_code}: {resp.text}")
 
     return resp.json()["choices"][0]["message"]["content"]
+
+
+async def chars_per_token(text: str) -> float:
+    """Calibrate the chars->tokens ratio on this transcript.
+
+    Packing decisions are made on character counts, which is cheap but depends on
+    the language. One call to the real tokenizer pins the ratio; if the endpoint
+    is not there we fall back to a figure conservative enough for Spanish.
+    """
+    sample = text[:20000]
+    if not sample:
+        return 3.0
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                TOKENIZE_URL, json={"model": SUMMARIZER_MODEL, "prompt": sample}
+            )
+        if resp.status_code == 200:
+            body = resp.json()
+            count = body.get("count") or len(body.get("tokens") or [])
+            if count:
+                return len(sample) / count
+    except httpx.HTTPError:
+        pass
+    logger.warning("Could not reach %s; estimating tokens by character count.", TOKENIZE_URL)
+    return 3.0
+
+
+def pack_ranges(lines: list[str], budget_chars: float, start: int = 0, stop: int | None = None):
+    """Group consecutive lines into [from, to) ranges under the budget.
+
+    Lines are never split: a transcript line is one speaker turn, and cutting
+    somebody mid-sentence is what makes naive chunking produce bad sections.
+    """
+    stop = len(lines) if stop is None else stop
+    ranges, begin, size = [], start, 0
+    for i in range(start, stop):
+        length = len(lines[i]) + 1
+        if size and size + length > budget_chars:
+            ranges.append((begin, i))
+            begin, size = i, 0
+        size += length
+    if begin < stop:
+        ranges.append((begin, stop))
+    return ranges
+
+
+def parse_boundaries(raw: str) -> dict[int, str]:
+    """Pull {block: title} out of the segmenter's reply.
+
+    The model is asked for bare JSON but sometimes wraps it in prose or a fence,
+    so we take the outermost array rather than trusting the whole string.
+    """
+    match = re.search(r"\[.*\]", raw, re.DOTALL)
+    if not match:
+        return {}
+    try:
+        items = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        logger.warning("Segmenter returned invalid JSON, ignoring this window.")
+        return {}
+
+    found = {}
+    for item in items:
+        if isinstance(item, dict) and isinstance(item.get("block"), int):
+            found[item["block"]] = str(item.get("title") or "Untitled section")
+    return found
+
+
+async def find_sections(lines: list[str], ratio: float) -> list[tuple[int, int, str]]:
+    """Split the transcript into (from, to, title) topical sections.
+
+    Two passes, because topic boundaries and size limits solve different problems:
+    the model marks where topics change, then any section still too large for a
+    leaf call is subdivided by size. A single topic can run for forty minutes.
+    """
+    window_chars = SEGMENTATION_WINDOW_TOKENS * ratio
+    boundaries: dict[int, str] = {}
+
+    for start, stop in pack_ranges(lines, window_chars):
+        numbered = "\n".join(f"[{i}] {lines[i]}" for i in range(start, stop))
+        raw = await chat(SEGMENTER_PROMPT, numbered, max_tokens=1024)
+        for block, title in parse_boundaries(raw).items():
+            # Ignore a boundary on the window's own first block: it is where we cut,
+            # not a topic change the model found.
+            if start < block < stop:
+                boundaries[block] = title
+
+    cuts = sorted(boundaries)
+    logger.info("Segmentation found %d topic boundaries.", len(cuts))
+
+    topics, previous, title = [], 0, "Opening"
+    for cut in cuts:
+        topics.append((previous, cut, title))
+        previous, title = cut, boundaries[cut]
+    topics.append((previous, len(lines), title))
+
+    section_chars = SECTION_BUDGET_TOKENS * ratio
+    sections = []
+    for start, stop, title in topics:
+        if start >= stop:
+            continue
+        parts = pack_ranges(lines, section_chars, start, stop)
+        for n, (a, b) in enumerate(parts):
+            sections.append((a, b, title if len(parts) == 1 else f"{title} ({n + 1}/{len(parts)})"))
+    return sections
+
+
+async def summarize_text(transcript: str, instructions: str | None) -> str:
+    """Summarize a transcript, going hierarchical when it does not fit in one pass.
+
+    A transcript that fits is summarized directly: the model seeing the whole
+    meeting at once connects a decision at minute 10 with its follow-up at minute
+    50, which a chunked pass cannot. Beyond that it is segmented by topic, each
+    section is turned into notes, and the notes are reduced into the summary.
+    """
+    transcript = transcript.strip()
+    if not transcript:
+        raise HTTPException(status_code=400, detail="The transcript is empty.")
+
+    ratio = await chars_per_token(transcript)
+    approx_tokens = len(transcript) / ratio
+    # Leave room for the reply and the prompts themselves.
+    single_pass_budget = SUMMARIZER_CONTEXT - SUMMARY_MAX_TOKENS - 1000
+
+    if approx_tokens <= single_pass_budget:
+        logger.info("Transcript is ~%d tokens: summarizing in one pass.", approx_tokens)
+        return await reduce_summary(transcript, instructions, source="transcript")
+
+    lines = [line for line in transcript.splitlines() if line.strip()]
+    sections = await find_sections(lines, ratio)
+    logger.info("Transcript is ~%d tokens: %d sections.", approx_tokens, len(sections))
+
+    semaphore = asyncio.Semaphore(MAP_CONCURRENCY)
+
+    async def notes_for(start: int, stop: int, title: str) -> str:
+        body = "\n".join(lines[start:stop])
+        async with semaphore:
+            notes = await chat(EXTRACTOR_PROMPT, f"# {title}\n\n{body}", NOTES_MAX_TOKENS)
+        return f"## {title}\n\n{notes.strip()}"
+
+    notes = await asyncio.gather(*(notes_for(*section) for section in sections))
+    combined = "\n\n".join(notes)
+
+    # The notes are a fraction of the transcript, but a very long meeting can still
+    # overflow the reduce. Fold them down a level at a time until they fit.
+    while len(combined) / ratio > single_pass_budget:
+        blocks = combined.split("\n\n")
+        groups = pack_ranges(blocks, SECTION_BUDGET_TOKENS * ratio)
+        if len(groups) <= 1:
+            # Cannot split further; the reduce would 400 on context length anyway.
+            logger.warning("Notes do not fit and cannot be folded further, truncating.")
+            combined = combined[: int(single_pass_budget * ratio)]
+            break
+        logger.info("Notes still too long, folding %d blocks into %d.", len(blocks), len(groups))
+        folded = await asyncio.gather(*(
+            chat(EXTRACTOR_PROMPT, "\n\n".join(blocks[a:b]), NOTES_MAX_TOKENS)
+            for a, b in groups
+        ))
+        combined = "\n\n".join(folded)
+
+    return await reduce_summary(combined, instructions, source="notes")
+
+
+async def reduce_summary(body: str, instructions: str | None, source: str) -> str:
+    header = (
+        "Here is the full meeting transcript."
+        if source == "transcript"
+        else "Here are the notes taken over the meeting, section by section, in order."
+    )
+    user_content = f"{header}\n\n{body}"
+    if instructions:
+        user_content = f"{instructions}\n\n---\n\n{user_content}"
+    return await chat(SYSTEM_PROMPT, user_content, SUMMARY_MAX_TOKENS)
 
 
 async def run_transcription(

@@ -47,6 +47,9 @@ services:
       - HF_TOKEN=${HF_TOKEN}
       - HF_HUB_OFFLINE=1
       - ASR_URL=http://vllm-asr:8000/v1/audio/transcriptions
+      # Must match --max-model-len on vllm-summarize: the pipeline uses it to
+      # decide between a single pass and the segment/extract/reduce path.
+      - SUMMARIZER_CONTEXT=32768
     volumes:
       - ${HF_CACHE_DIR:-./hf-cache}:/root/.cache/huggingface
     ports:
@@ -80,7 +83,10 @@ services:
       # ~42 GB of weights + activations; the rest of the budget goes to KV cache.
       # Leaves room for vllm-asr (0.15) and the system in unified memory.
       - --gpu-memory-utilization=0.50
-      - --max-model-len=16384
+      # An hour of meeting is ~15-20k tokens once speaker labels and timestamps
+      # are counted, so 16384 left the reply almost no room. Keep SUMMARIZER_CONTEXT
+      # on the pipeline service in sync with this.
+      - --max-model-len=32768
     deploy:
       resources:
         reservations:

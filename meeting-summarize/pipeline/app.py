@@ -47,6 +47,9 @@ NOTES_MAX_TOKENS = int(os.environ.get("NOTES_MAX_TOKENS", "1536"))
 SECTION_BUDGET_TOKENS = int(os.environ.get("SECTION_BUDGET_TOKENS", "6000"))
 # The segmentation pass only emits boundaries, so its window can be much larger.
 SEGMENTATION_WINDOW_TOKENS = int(os.environ.get("SEGMENTATION_WINDOW_TOKENS", "12000"))
+# Every leaf call carries the meeting's outline so it can spot cross-topic links.
+# A very long meeting has enough sections that the list itself needs a ceiling.
+OUTLINE_MAX_TOKENS = int(os.environ.get("OUTLINE_MAX_TOKENS", "600"))
 # vLLM batches concurrent requests, and batching is what makes a memory-bound 72B
 # worth running: the weights are read once for the whole batch.
 MAP_CONCURRENCY = int(os.environ.get("MAP_CONCURRENCY", "4"))
@@ -99,6 +102,14 @@ EXTRACTOR_PROMPT = f"""You take structured notes on one section of a meeting tra
 Do NOT write a summary or a narrative: extract the facts, so that someone can write
 the summary later from your notes alone. Keep the detail - this is the step where
 information gets lost if you compress it.
+
+You may be given the meeting's outline first: the title of every section, in order,
+with yours marked. Those other sections are context, never material - take notes only
+on the transcript you are given. Use the outline to notice when something said in your
+section bears on another one, and record the link explicitly when it does: a decision
+another topic depends on, a figure or commitment referenced elsewhere, something that
+revisits or contradicts an earlier topic. Whoever writes the summary sees the notes and
+not the transcript, so a connection you leave out is lost for good.
 
 {_LANGUAGE_RULE} Reply in Markdown bullets, covering whatever is present: points made
 (and by which speaker), decisions taken, action items with their owner, figures, dates,
@@ -414,6 +425,45 @@ async def find_sections(lines: list[str], ratio: float) -> list[tuple[int, int, 
     return sections
 
 
+def format_outline(sections: list[tuple[int, int, str]], current: int, budget_chars: float) -> str:
+    """List the section titles in order, marking the one being extracted.
+
+    A leaf call only sees its own slice of the meeting, so without this it cannot
+    tell that what it just read is what another topic later depends on. When the
+    meeting has too many sections to list, the ones nearest the current section are
+    the ones most likely to be related, so the list is trimmed from the outside in.
+    """
+    entries = [
+        f"{n + 1}. {title}" + (" <-- your section" if n == current else "")
+        for n, (_, _, title) in enumerate(sections)
+    ]
+    size = sum(len(entry) + 1 for entry in entries)
+    if size <= budget_chars:
+        return "\n".join(entries)
+
+    low = high = current
+    size = len(entries[current]) + 1
+    while True:
+        grew = False
+        if low > 0 and size + len(entries[low - 1]) + 1 <= budget_chars:
+            low -= 1
+            size += len(entries[low]) + 1
+            grew = True
+        if high < len(entries) - 1 and size + len(entries[high + 1]) + 1 <= budget_chars:
+            high += 1
+            size += len(entries[high]) + 1
+            grew = True
+        if not grew:
+            break
+
+    window = entries[low:high + 1]
+    if low > 0:
+        window.insert(0, f"... ({low} earlier sections)")
+    if high < len(entries) - 1:
+        window.append(f"... ({len(entries) - 1 - high} later sections)")
+    return "\n".join(window)
+
+
 async def summarize_text(transcript: str, instructions: str | None) -> str:
     """Summarize a transcript, going hierarchical when it does not fit in one pass.
 
@@ -441,13 +491,22 @@ async def summarize_text(transcript: str, instructions: str | None) -> str:
 
     semaphore = asyncio.Semaphore(MAP_CONCURRENCY)
 
-    async def notes_for(start: int, stop: int, title: str) -> str:
+    outline_chars = OUTLINE_MAX_TOKENS * ratio
+
+    async def notes_for(index: int, start: int, stop: int, title: str) -> str:
         body = "\n".join(lines[start:stop])
+        outline = format_outline(sections, index, outline_chars)
+        user_content = (
+            f"# Meeting outline\n\n{outline}\n\n"
+            f"# Section {index + 1}: {title}\n\n{body}"
+        )
         async with semaphore:
-            notes = await chat(EXTRACTOR_PROMPT, f"# {title}\n\n{body}", NOTES_MAX_TOKENS)
+            notes = await chat(EXTRACTOR_PROMPT, user_content, NOTES_MAX_TOKENS)
         return f"## {title}\n\n{notes.strip()}"
 
-    notes = await asyncio.gather(*(notes_for(*section) for section in sections))
+    notes = await asyncio.gather(*(
+        notes_for(index, *section) for index, section in enumerate(sections)
+    ))
     combined = "\n\n".join(notes)
 
     # The notes are a fraction of the transcript, but a very long meeting can still
